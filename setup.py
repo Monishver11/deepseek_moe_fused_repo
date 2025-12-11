@@ -14,7 +14,7 @@ setup(
     name="deepseek_moe_fused",
     version="0.1.0",
     description="Fused Triton kernel for DeepSeek-style Mixture of Experts",
-    author="Abdur",
+    author="Monishver",
     packages=find_packages(),
     python_requires=">=3.10",
     install_requires=[
