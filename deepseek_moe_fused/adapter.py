@@ -198,6 +198,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         return output, aux_loss_dict
     
+    @torch.compiler.disable
     def _fused_up_projection(
         self,
         x_flat: Tensor,           # [N, dim]
@@ -243,6 +244,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         return h_up_sorted
     
+    @torch.compiler.disable
     def _naive_up_projection(
         self,
         x_flat: Tensor,
@@ -275,6 +277,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         return h_shared + h_routed
     
+    @torch.compiler.disable
     def _down_projection(
         self,
         h_sorted: Tensor,           # [total_assignments, hdim]
