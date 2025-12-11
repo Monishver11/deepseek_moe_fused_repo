@@ -84,12 +84,15 @@ class FusedDeepSeekMoEMLP(nn.Module):
         self.router = nn.Linear(dim, num_routed_experts, bias=False)
         self.router.weight.label = 'moe_router'
         
-        # UP projection: [num_routed_experts, dim, hdim]
-        # Stacked for efficient kernel access
-        self.routed_experts_up = nn.Parameter(
-            torch.empty(num_routed_experts, dim, self.hdim)
-        )
-        self.routed_experts_up.label = 'mlp'
+        # UP projection: ParameterList of [dim, hdim] each
+        # Kept as list for optimizer compatibility (NorMuon expects 2D tensors)
+        # Will be stacked to 3D at forward time for the kernel
+        self.routed_experts_up = nn.ParameterList([
+            nn.Parameter(torch.empty(dim, self.hdim))
+            for _ in range(num_routed_experts)
+        ])
+        for p in self.routed_experts_up:
+            p.label = 'mlp'
         
         # DOWN projection: ParameterList of [dim, hdim] each
         # Kept as list since DOWN isn't fused
@@ -117,7 +120,8 @@ class FusedDeepSeekMoEMLP(nn.Module):
             self.shared_expert_down.zero_()
             
             # Routed experts: uniform for UP, zero for DOWN
-            self.routed_experts_up.uniform_(-bound, bound)
+            for up_w in self.routed_experts_up:
+                up_w.uniform_(-bound, bound)
             for down_w in self.routed_experts_down:
                 down_w.zero_()
     
@@ -218,7 +222,8 @@ class FusedDeepSeekMoEMLP(nn.Module):
         """
         # Ensure BF16 for kernel
         x_bf16 = x_flat.to(torch.bfloat16)
-        W_routed_bf16 = self.routed_experts_up.to(torch.bfloat16)
+        # Stack ParameterList into 3D tensor [E, dim, hdim] for kernel
+        W_routed_bf16 = torch.stack(list(self.routed_experts_up)).to(torch.bfloat16)
         W_shared_bf16 = self.shared_expert_up.to(torch.bfloat16)
         
         # Compute tokens_per_expert using scatter_add (fixed output size, dynamo-compatible)
