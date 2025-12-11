@@ -216,11 +216,14 @@ class FusedDeepSeekMoEMLP(nn.Module):
         W_routed_bf16 = self.routed_experts_up.to(torch.bfloat16)
         W_shared_bf16 = self.shared_expert_up.to(torch.bfloat16)
         
-        # Grid config (needed for API but new kernel uses 2D grid internally)
-        tokens_per_expert = torch.bincount(
-            sorted_expert_indices.long(),
-            minlength=self.num_routed_experts
-        ).to(torch.int32)
+        # Compute tokens_per_expert using scatter_add (fixed output size, dynamo-compatible)
+        # This replaces torch.bincount which has dynamic output shape
+        tokens_per_expert = torch.zeros(
+            self.num_routed_experts, dtype=torch.int32, device=x_flat.device
+        )
+        ones = torch.ones(total_assignments, dtype=torch.int32, device=x_flat.device)
+        tokens_per_expert.scatter_add_(0, sorted_expert_indices.long(), ones)
+        
         grid_config = get_grid_config(tokens_per_expert, block_m=32, num_experts=self.num_routed_experts)
         
         # Launch fused kernel
