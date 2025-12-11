@@ -88,7 +88,11 @@ class FusedMoEUpProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_Y_sorted: Tensor):
         """
-        Backward pass using vectorized PyTorch operations (no .item() calls).
+        Backward pass using memory-efficient PyTorch operations.
+        
+        Uses torch.split to avoid both:
+        1. Multiple .item() syncs (use single .tolist() instead)
+        2. Huge intermediate tensors from einsum/bmm
         
         Gradients:
             ∂L/∂X = (∂L/∂Y @ W_routed.T + ∂L/∂Y @ W_shared.T) [scattered back]
@@ -112,37 +116,48 @@ class FusedMoEUpProjection(torch.autograd.Function):
         X_sorted = X[sorted_token_indices.long()].float()  # [total_assignments, H]
         
         # ======================================================================
-        # Gradient w.r.t. W_shared (simple matmul)
+        # Gradient w.r.t. W_shared (simple matmul, memory efficient)
         # ======================================================================
         grad_W_shared = torch.mm(X_sorted.t(), grad_Y).to(W_shared.dtype)  # [H, D]
         
         # ======================================================================
-        # Gradient w.r.t. W_routed (vectorized with einsum)
+        # Split tensors by expert (SINGLE sync via .tolist())
+        # Since tokens are sorted by expert, we can use torch.split
         # ======================================================================
-        # Create one-hot expert mask [total_assignments, E]
-        expert_one_hot = F.one_hot(sorted_expert_indices.long(), num_classes=E).float()
-        
-        # grad_W_routed[e, h, d] = sum_{i: expert[i]=e} X_sorted[i, h] * grad_Y[i, d]
-        # Using einsum: 'th,td,te->ehd'
-        grad_W_routed = torch.einsum('th,td,te->ehd', X_sorted, grad_Y, expert_one_hot).to(W_routed.dtype)
+        sizes = tokens_per_expert.tolist()  # Single CPU-GPU sync for all sizes
+        X_splits = torch.split(X_sorted, sizes)
+        grad_Y_splits = torch.split(grad_Y, sizes)
         
         # ======================================================================
-        # Gradient w.r.t. X (vectorized)
+        # Gradient w.r.t. W_routed (per-expert matmul, memory efficient)
+        # ======================================================================
+        grad_W_routed = torch.zeros_like(W_routed)
+        for e in range(num_experts):
+            if sizes[e] > 0:
+                # X_e.T @ grad_Y_e: [H, n_e] @ [n_e, D] -> [H, D]
+                grad_W_routed[e] = torch.mm(X_splits[e].t(), grad_Y_splits[e]).to(W_routed.dtype)
+        
+        # ======================================================================
+        # Gradient w.r.t. X (per-expert matmul, memory efficient)
         # ======================================================================
         # Shared contribution: same W_shared for all assignments
         grad_from_shared = torch.mm(grad_Y, W_shared.t().float())  # [total_assignments, H]
         
-        # Routed contribution: different W_routed per token based on expert assignment
-        # W_routed_selected[i] = W_routed[expert_i], shape [total_assignments, H, D]
-        W_routed_selected = W_routed[sorted_expert_indices.long()].float()  # [T, H, D]
+        # Routed contribution: per-expert matmul, then concatenate
+        grad_from_routed_splits = []
+        for e in range(num_experts):
+            if sizes[e] > 0:
+                # grad_Y_e @ W_routed[e].T: [n_e, D] @ [D, H] -> [n_e, H]
+                grad_from_routed_splits.append(
+                    torch.mm(grad_Y_splits[e], W_routed[e].t().float())
+                )
+            else:
+                # Empty tensor for this expert
+                grad_from_routed_splits.append(
+                    torch.empty(0, H, dtype=torch.float32, device=X.device)
+                )
         
-        # grad_from_routed[i] = grad_Y[i] @ W_routed[expert_i].T
-        # = (grad_Y @ W_routed_selected.transpose) for each token
-        # Using bmm: [T, 1, D] @ [T, D, H] -> [T, 1, H] -> squeeze -> [T, H]
-        grad_from_routed = torch.bmm(
-            grad_Y.unsqueeze(1),           # [T, 1, D]
-            W_routed_selected.transpose(1, 2)  # [T, D, H]
-        ).squeeze(1)  # [T, H]
+        grad_from_routed = torch.cat(grad_from_routed_splits, dim=0)  # [total_assignments, H]
         
         # Total gradient in sorted order, then scatter back
         grad_X_sorted = grad_from_routed + grad_from_shared  # [total_assignments, H]
