@@ -23,7 +23,7 @@ Quick Start:
     output, aux_loss = moe_layer(x)
 """
 
-from .adapter import FusedDeepSeekMoEMLP, FusedMoEMLP
+from .adapter import FusedDeepSeekMoEMLP
 from .moe_layer import DeepSeekMoELayer
 from .kernels import fused_moe_forward
 from .utils import compute_routing_metadata, get_grid_config
@@ -32,7 +32,6 @@ from .config import MoEConfig
 __all__ = [
     # Main adapter (drop-in replacement)
     'FusedDeepSeekMoEMLP',
-    'FusedMoEMLP',
     # Lower-level components
     'DeepSeekMoELayer',
     'fused_moe_forward',
