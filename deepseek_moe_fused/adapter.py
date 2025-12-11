@@ -88,7 +88,7 @@ class FusedMoEUpProjection(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_Y_sorted: Tensor):
         """
-        Backward pass using standard PyTorch operations.
+        Backward pass using vectorized PyTorch operations (no .item() calls).
         
         Gradients:
             ∂L/∂X = (∂L/∂Y @ W_routed.T + ∂L/∂Y @ W_shared.T) [scattered back]
@@ -109,50 +109,45 @@ class FusedMoEUpProjection(torch.autograd.Function):
         grad_Y = grad_Y_sorted.float()  # [total_assignments, D]
         
         # Gather X in sorted order
-        X_sorted = X[sorted_token_indices.long()]  # [total_assignments, H]
+        X_sorted = X[sorted_token_indices.long()].float()  # [total_assignments, H]
         
         # ======================================================================
-        # Gradient w.r.t. W_shared
+        # Gradient w.r.t. W_shared (simple matmul)
         # ======================================================================
-        # ∂L/∂W_shared = X_sorted.T @ grad_Y
-        grad_W_shared = torch.mm(X_sorted.t().float(), grad_Y).to(W_shared.dtype)  # [H, D]
+        grad_W_shared = torch.mm(X_sorted.t(), grad_Y).to(W_shared.dtype)  # [H, D]
         
         # ======================================================================
-        # Gradient w.r.t. W_routed (per-expert)
+        # Gradient w.r.t. W_routed (vectorized with einsum)
         # ======================================================================
-        grad_W_routed = torch.zeros_like(W_routed)
+        # Create one-hot expert mask [total_assignments, E]
+        expert_one_hot = F.one_hot(sorted_expert_indices.long(), num_classes=E).float()
         
-        # Compute expert token offsets
-        expert_token_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=X.device)
-        expert_token_offsets[1:] = torch.cumsum(tokens_per_expert.long(), dim=0)
-        
-        for e in range(num_experts):
-            start = expert_token_offsets[e].item()
-            end = expert_token_offsets[e + 1].item()
-            if end > start:
-                X_e = X_sorted[start:end].float()
-                grad_Y_e = grad_Y[start:end]
-                grad_W_routed[e] = torch.mm(X_e.t(), grad_Y_e).to(W_routed.dtype)
+        # grad_W_routed[e, h, d] = sum_{i: expert[i]=e} X_sorted[i, h] * grad_Y[i, d]
+        # Using einsum: 'th,td,te->ehd'
+        grad_W_routed = torch.einsum('th,td,te->ehd', X_sorted, grad_Y, expert_one_hot).to(W_routed.dtype)
         
         # ======================================================================
-        # Gradient w.r.t. X
+        # Gradient w.r.t. X (vectorized)
         # ======================================================================
-        grad_X = torch.zeros_like(X).float()
-        
-        # Shared contribution
+        # Shared contribution: same W_shared for all assignments
         grad_from_shared = torch.mm(grad_Y, W_shared.t().float())  # [total_assignments, H]
         
-        # Routed contribution (per-expert)
-        grad_from_routed = torch.zeros(total_assignments, H, device=X.device, dtype=torch.float32)
-        for e in range(num_experts):
-            start = expert_token_offsets[e].item()
-            end = expert_token_offsets[e + 1].item()
-            if end > start:
-                grad_Y_e = grad_Y[start:end]
-                grad_from_routed[start:end] = torch.mm(grad_Y_e, W_routed[e].t().float())
+        # Routed contribution: different W_routed per token based on expert assignment
+        # W_routed_selected[i] = W_routed[expert_i], shape [total_assignments, H, D]
+        W_routed_selected = W_routed[sorted_expert_indices.long()].float()  # [T, H, D]
+        
+        # grad_from_routed[i] = grad_Y[i] @ W_routed[expert_i].T
+        # = (grad_Y @ W_routed_selected.transpose) for each token
+        # Using bmm: [T, 1, D] @ [T, D, H] -> [T, 1, H] -> squeeze -> [T, H]
+        grad_from_routed = torch.bmm(
+            grad_Y.unsqueeze(1),           # [T, 1, D]
+            W_routed_selected.transpose(1, 2)  # [T, D, H]
+        ).squeeze(1)  # [T, H]
         
         # Total gradient in sorted order, then scatter back
-        grad_X_sorted = grad_from_routed + grad_from_shared
+        grad_X_sorted = grad_from_routed + grad_from_shared  # [total_assignments, H]
+        
+        grad_X = torch.zeros(N, H, dtype=torch.float32, device=X.device)
         grad_X.index_add_(0, sorted_token_indices.long(), grad_X_sorted)
         grad_X = grad_X.to(X.dtype)
         
