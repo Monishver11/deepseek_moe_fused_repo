@@ -6,8 +6,13 @@ DeepSeekMoEMLP in train_gpt_deepseek_moe.py.
 
 The adapter:
 1. Uses the fused Triton kernel for UP-projection (shared + routed combined)
-2. Falls back to naive PyTorch if kernel fails
+2. Has proper autograd backward pass for training
 3. Maintains identical interface (input/output shapes, aux_loss_dict)
+
+Key Design:
+- Routing is computed OUTSIDE the autograd function (torch.compile compatible)
+- FusedMoEUpProjection autograd.Function wraps the kernel with backward pass
+- Backward pass uses standard PyTorch (correct, not fused)
 """
 
 import torch
@@ -18,6 +23,147 @@ from typing import Dict, Tuple, Optional
 
 from .kernels import fused_moe_forward
 from .utils import get_grid_config
+
+
+class FusedMoEUpProjection(torch.autograd.Function):
+    """
+    Autograd Function for fused MoE UP-projection.
+    
+    Forward: Uses custom Triton kernel for fused routed+shared computation
+    Backward: Uses standard PyTorch operations for gradient computation
+    
+    Computes: Y_sorted = X[sorted_indices] @ W_routed[expert_ids] + X[sorted_indices] @ W_shared
+    
+    This is separate from routing - routing metadata is computed outside and passed in.
+    This design allows torch.compile compatibility for the routing part.
+    """
+    
+    @staticmethod
+    def forward(
+        ctx,
+        X: Tensor,                        # [N, H] input activations
+        W_routed: Tensor,                 # [E, H, D] routed expert weights (stacked)
+        W_shared: Tensor,                 # [H, D] shared expert weights
+        sorted_token_indices: Tensor,     # [total_assignments] - which rows of X
+        sorted_expert_indices: Tensor,    # [total_assignments] - which expert
+        tokens_per_expert: Tensor,        # [E] - count per expert
+        num_experts: int,
+        block_m: int = 32,
+        block_n: int = 64,
+        block_k: int = 32,
+    ) -> Tensor:
+        """
+        Forward pass using fused Triton kernel.
+        
+        Returns:
+            Y_sorted: [total_assignments, D] - Output in sorted expert order
+        """
+        # Get grid config for kernel launch
+        grid_config = get_grid_config(tokens_per_expert, block_m, num_experts)
+        
+        # Launch fused kernel
+        Y_sorted = fused_moe_forward(
+            X=X,
+            W_routed=W_routed,
+            W_shared=W_shared,
+            sorted_token_indices=sorted_token_indices,
+            sorted_expert_indices=sorted_expert_indices,
+            expert_token_offsets=grid_config.expert_token_offsets,
+            total_blocks=grid_config.total_blocks,
+            num_experts=num_experts,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
+        
+        # Save for backward
+        ctx.save_for_backward(
+            X, W_routed, W_shared,
+            sorted_token_indices, sorted_expert_indices, tokens_per_expert,
+        )
+        ctx.num_experts = num_experts
+        
+        return Y_sorted
+    
+    @staticmethod
+    def backward(ctx, grad_Y_sorted: Tensor):
+        """
+        Backward pass using standard PyTorch operations.
+        
+        Gradients:
+            ∂L/∂X = (∂L/∂Y @ W_routed.T + ∂L/∂Y @ W_shared.T) [scattered back]
+            ∂L/∂W_routed[e] = X[tokens_for_e].T @ ∂L/∂Y[tokens_for_e]
+            ∂L/∂W_shared = X_sorted.T @ ∂L/∂Y
+        """
+        (
+            X, W_routed, W_shared,
+            sorted_token_indices, sorted_expert_indices, tokens_per_expert,
+        ) = ctx.saved_tensors
+        num_experts = ctx.num_experts
+        
+        N, H = X.shape
+        E, _, D = W_routed.shape
+        total_assignments = sorted_token_indices.shape[0]
+        
+        # Cast grad to float32 for stable accumulation
+        grad_Y = grad_Y_sorted.float()  # [total_assignments, D]
+        
+        # Gather X in sorted order
+        X_sorted = X[sorted_token_indices.long()]  # [total_assignments, H]
+        
+        # ======================================================================
+        # Gradient w.r.t. W_shared
+        # ======================================================================
+        # ∂L/∂W_shared = X_sorted.T @ grad_Y
+        grad_W_shared = torch.mm(X_sorted.t().float(), grad_Y).to(W_shared.dtype)  # [H, D]
+        
+        # ======================================================================
+        # Gradient w.r.t. W_routed (per-expert)
+        # ======================================================================
+        grad_W_routed = torch.zeros_like(W_routed)
+        
+        # Compute expert token offsets
+        expert_token_offsets = torch.zeros(num_experts + 1, dtype=torch.int64, device=X.device)
+        expert_token_offsets[1:] = torch.cumsum(tokens_per_expert.long(), dim=0)
+        
+        for e in range(num_experts):
+            start = expert_token_offsets[e].item()
+            end = expert_token_offsets[e + 1].item()
+            if end > start:
+                X_e = X_sorted[start:end].float()
+                grad_Y_e = grad_Y[start:end]
+                grad_W_routed[e] = torch.mm(X_e.t(), grad_Y_e).to(W_routed.dtype)
+        
+        # ======================================================================
+        # Gradient w.r.t. X
+        # ======================================================================
+        grad_X = torch.zeros_like(X).float()
+        
+        # Shared contribution
+        grad_from_shared = torch.mm(grad_Y, W_shared.t().float())  # [total_assignments, H]
+        
+        # Routed contribution (per-expert)
+        grad_from_routed = torch.zeros(total_assignments, H, device=X.device, dtype=torch.float32)
+        for e in range(num_experts):
+            start = expert_token_offsets[e].item()
+            end = expert_token_offsets[e + 1].item()
+            if end > start:
+                grad_Y_e = grad_Y[start:end]
+                grad_from_routed[start:end] = torch.mm(grad_Y_e, W_routed[e].t().float())
+        
+        # Total gradient in sorted order, then scatter back
+        grad_X_sorted = grad_from_routed + grad_from_shared
+        grad_X.index_add_(0, sorted_token_indices.long(), grad_X_sorted)
+        grad_X = grad_X.to(X.dtype)
+        
+        # Return gradients (None for non-tensor args)
+        return (
+            grad_X,
+            grad_W_routed,
+            grad_W_shared,
+            None, None, None,  # sorted_token_indices, sorted_expert_indices, tokens_per_expert
+            None, None, None, None,  # num_experts, block_m, block_n, block_k
+        )
 
 
 class FusedDeepSeekMoEMLP(nn.Module):
@@ -37,8 +183,8 @@ class FusedDeepSeekMoEMLP(nn.Module):
     Into a single memory load of X, saving ~50% bandwidth on UP projection.
     
     torch.compile Compatibility:
-        - use_fused=False (default): Fully traceable, works with fullgraph=True
-        - use_fused=True: Uses Triton kernel, requires fullgraph=False or no torch.compile
+        - use_fused=False: Fully traceable, works with fullgraph=True
+        - use_fused=True: Uses Triton kernel with autograd backward, works with fullgraph=False
     
     Args:
         dim: Model dimension (hidden size)
@@ -46,7 +192,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         num_routed_experts: Number of routed experts (E)
         top_k: Number of experts selected per token
         expert_capacity_factor: (unused, kept for interface compatibility)
-        use_fused: If True, use fused Triton kernel (not compatible with fullgraph=True)
+        use_fused: If True, use fused Triton kernel for forward pass
     """
     
     def __init__(
@@ -56,12 +202,11 @@ class FusedDeepSeekMoEMLP(nn.Module):
         num_routed_experts: int = 4,
         top_k: int = 2,
         expert_capacity_factor: float = 1.25,
-        use_fused: bool = False,  # Default False for torch.compile compatibility
+        use_fused: bool = False,  # Default False for torch.compile fullgraph compatibility
     ):
         super().__init__()
         
-        # Validate constraints
-        assert num_shared_experts == 1, "Fused kernel only supports num_shared_experts=1"
+        assert num_shared_experts == 1, "Fused kernel only supports 1 shared expert"
         
         self.dim = dim
         self.num_shared_experts = num_shared_experts
@@ -95,7 +240,6 @@ class FusedDeepSeekMoEMLP(nn.Module):
             p.label = 'mlp'
         
         # DOWN projection: ParameterList of [dim, hdim] each
-        # Kept as list since DOWN isn't fused
         self.routed_experts_down = nn.ParameterList([
             nn.Parameter(torch.empty(dim, self.hdim))
             for _ in range(num_routed_experts)
@@ -127,7 +271,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
     
     def forward(self, x: Tensor) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
-        Forward pass with fused UP-projection.
+        Forward pass with optional fused UP-projection.
         
         Args:
             x: Input tensor [B, T, dim]
@@ -165,18 +309,19 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         total_assignments = N * self.top_k
         
-        # ====== FUSED UP-PROJECTION ======
-        # use_fused=True requires NOT using torch.compile with fullgraph=True
+        # Compute tokens_per_expert using scatter_add (torch.compile compatible)
+        tokens_per_expert = torch.zeros(
+            self.num_routed_experts, dtype=torch.int32, device=x_flat.device
+        )
+        ones = torch.ones(total_assignments, dtype=torch.int32, device=x_flat.device)
+        tokens_per_expert.scatter_add_(0, sorted_expert_indices.long(), ones)
+        
+        # ====== UP-PROJECTION ======
         if self.use_fused:
-            try:
-                h_up_sorted = self._fused_up_projection(
-                    x_flat, sorted_token_indices, sorted_expert_indices, total_assignments
-                )
-            except Exception as e:
-                print(f"[FusedMoE] Kernel failed, falling back to naive: {e}")
-                h_up_sorted = self._naive_up_projection(
-                    x_flat, sorted_token_indices, sorted_expert_indices, total_assignments
-                )
+            h_up_sorted = self._fused_up_projection(
+                x_flat, sorted_token_indices, sorted_expert_indices, 
+                tokens_per_expert, total_assignments
+            )
         else:
             h_up_sorted = self._naive_up_projection(
                 x_flat, sorted_token_indices, sorted_expert_indices, total_assignments
@@ -186,7 +331,6 @@ class FusedDeepSeekMoEMLP(nn.Module):
         h_act_sorted = F.relu(h_up_sorted).square()
         
         # ====== DOWN-PROJECTION (Not Fused) ======
-        # Compute per-expert DOWN projection
         y_sorted = self._down_projection(
             h_act_sorted, sorted_expert_indices, total_assignments
         )
@@ -212,13 +356,11 @@ class FusedDeepSeekMoEMLP(nn.Module):
         x_flat: Tensor,           # [N, dim]
         sorted_token_indices: Tensor,   # [total_assignments]
         sorted_expert_indices: Tensor,  # [total_assignments]
+        tokens_per_expert: Tensor,      # [E]
         total_assignments: int,
     ) -> Tensor:
         """
-        Fused UP-projection using Triton kernel.
-        
-        Computes: h = x @ W_shared_up + x @ W_routed_up[expert_id]
-        With single load of x.
+        Fused UP-projection using Triton kernel with autograd backward.
         """
         # Ensure BF16 for kernel
         x_bf16 = x_flat.to(torch.bfloat16)
@@ -226,29 +368,18 @@ class FusedDeepSeekMoEMLP(nn.Module):
         W_routed_bf16 = torch.stack(list(self.routed_experts_up)).to(torch.bfloat16)
         W_shared_bf16 = self.shared_expert_up.to(torch.bfloat16)
         
-        # Compute tokens_per_expert using scatter_add (fixed output size, dynamo-compatible)
-        # This replaces torch.bincount which has dynamic output shape
-        tokens_per_expert = torch.zeros(
-            self.num_routed_experts, dtype=torch.int32, device=x_flat.device
-        )
-        ones = torch.ones(total_assignments, dtype=torch.int32, device=x_flat.device)
-        tokens_per_expert.scatter_add_(0, sorted_expert_indices.long(), ones)
-        
-        grid_config = get_grid_config(tokens_per_expert, block_m=32, num_experts=self.num_routed_experts)
-        
-        # Launch fused kernel
-        h_up_sorted = fused_moe_forward(
-            X=x_bf16,
-            W_routed=W_routed_bf16,
-            W_shared=W_shared_bf16,
-            sorted_token_indices=sorted_token_indices,
-            sorted_expert_indices=sorted_expert_indices,
-            expert_token_offsets=grid_config.expert_token_offsets,
-            total_blocks=grid_config.total_blocks,
-            num_experts=self.num_routed_experts,
-            BLOCK_M=32,
-            BLOCK_N=64,
-            BLOCK_K=32,
+        # Call autograd Function (has proper backward pass!)
+        h_up_sorted = FusedMoEUpProjection.apply(
+            x_bf16,
+            W_routed_bf16,
+            W_shared_bf16,
+            sorted_token_indices,
+            sorted_expert_indices,
+            tokens_per_expert,
+            self.num_routed_experts,
+            32,  # block_m
+            64,  # block_n
+            32,  # block_k
         )
         
         return h_up_sorted
@@ -271,7 +402,6 @@ class FusedDeepSeekMoEMLP(nn.Module):
         h_shared = F.linear(x_gathered, self.shared_expert_up.T.type_as(x_gathered))
         
         # Routed UP: compute for all experts and mask
-        # This avoids data-dependent branches for torch.compile compatibility
         h_routed = torch.zeros(
             total_assignments, self.hdim,
             dtype=x_gathered.dtype, device=x_gathered.device
@@ -295,14 +425,11 @@ class FusedDeepSeekMoEMLP(nn.Module):
         """
         DOWN-projection (not fused) - per-expert computation.
         Fully traceable by torch.compile.
-        
-        Both shared and routed DOWN projections.
         """
         # Shared DOWN: same for all
         y_shared = F.linear(h_sorted, self.shared_expert_down.type_as(h_sorted))
         
         # Routed DOWN: compute for all experts and mask
-        # This avoids data-dependent branches for torch.compile compatibility
         y_routed = torch.zeros(
             total_assignments, self.dim,
             dtype=h_sorted.dtype, device=h_sorted.device
@@ -326,22 +453,18 @@ class FusedDeepSeekMoEMLP(nn.Module):
         T: int,
     ) -> Dict[str, Tensor]:
         """
-        Compute auxiliary losses for MoE training.
-        
-        Same as original DeepSeekMoEMLP.
+        Compute auxiliary losses for load balancing.
         """
         N = B * T
         
-        # One-hot for load balancing (use first choice)
-        expert_mask_one_hot = F.one_hot(
-            topk_indices[:, 0], num_classes=self.num_routed_experts
-        ).float()
+        # One-hot encoding for load balancing
+        expert_mask = F.one_hot(topk_indices[:, 0], num_classes=self.num_routed_experts).float()
         
         # Fraction of tokens per expert
-        tokens_per_expert = expert_mask_one_hot.sum(dim=0)
+        tokens_per_expert = expert_mask.sum(dim=0)
         fraction_per_expert = tokens_per_expert / N
         
-        # Average router prob per expert
+        # Average router probability per expert
         avg_router_prob = router_probs.mean(dim=0)
         
         # Load balancing loss
@@ -349,23 +472,16 @@ class FusedDeepSeekMoEMLP(nn.Module):
             fraction_per_expert.detach() * avg_router_prob
         )
         
-        # Router Z-loss
-        router_z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        # Router Z-loss (entropy regularization)
+        router_z_loss = torch.logsumexp(router_logits, dim=-1).square().mean()
         
-        # Importance loss
+        # Importance loss (variance of total probability mass)
         importance = router_probs.sum(dim=0)
         importance_loss = torch.var(importance)
-        
-        # Expert counts (for monitoring)
-        expert_counts = tokens_per_expert
         
         return {
             'load_balancing_loss': load_balancing_loss,
             'router_z_loss': router_z_loss,
             'importance_loss': importance_loss,
-            'expert_counts': expert_counts,
+            'expert_counts': tokens_per_expert,
         }
-
-
-# Alias for backward compatibility
-FusedMoEMLP = FusedDeepSeekMoEMLP
