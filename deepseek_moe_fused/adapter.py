@@ -136,8 +136,9 @@ class FusedDeepSeekMoEMLP(nn.Module):
         N = B * T
         
         # ====== ROUTING ======
-        router_logits = self.router(x_flat)  # [N, num_routed_experts]
-        router_probs = F.softmax(router_logits, dim=-1)
+        # Cast router to input dtype for compatibility
+        router_logits = F.linear(x_flat, self.router.weight.type_as(x_flat))  # [N, num_routed_experts]
+        router_probs = F.softmax(router_logits.float(), dim=-1)  # Softmax in FP32 for stability
         
         # Top-k selection
         topk_weights, topk_indices = torch.topk(router_probs, k=self.top_k, dim=-1)
