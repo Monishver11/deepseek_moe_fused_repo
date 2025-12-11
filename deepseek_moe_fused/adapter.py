@@ -22,13 +22,13 @@ from .utils import get_grid_config
 
 class FusedDeepSeekMoEMLP(nn.Module):
     """
-    DeepSeek-style MoE with fused UP-projection kernel.
+    DeepSeek-style MoE with optional fused UP-projection kernel.
     
     Drop-in replacement for DeepSeekMoEMLP. Same interface:
         output, aux_loss_dict = layer(x)
     
     Architecture per expert:
-        UP:   h = x @ W_up        [dim -> hdim]   <- FUSED (shared + routed)
+        UP:   h = x @ W_up        [dim -> hdim]   <- FUSED (shared + routed) when use_fused=True
         ACT:  h = relu(h).square()
         DOWN: y = h @ W_down.T    [hdim -> dim]
     
@@ -36,13 +36,17 @@ class FusedDeepSeekMoEMLP(nn.Module):
         h_combined = x @ W_shared_up + x @ W_routed_up[expert_ids]
     Into a single memory load of X, saving ~50% bandwidth on UP projection.
     
+    torch.compile Compatibility:
+        - use_fused=False (default): Fully traceable, works with fullgraph=True
+        - use_fused=True: Uses Triton kernel, requires fullgraph=False or no torch.compile
+    
     Args:
         dim: Model dimension (hidden size)
         num_shared_experts: Number of shared experts (must be 1 for fused kernel)
         num_routed_experts: Number of routed experts (E)
         top_k: Number of experts selected per token
         expert_capacity_factor: (unused, kept for interface compatibility)
-        use_fused: If True, use fused Triton kernel. If False, use naive PyTorch.
+        use_fused: If True, use fused Triton kernel (not compatible with fullgraph=True)
     """
     
     def __init__(
@@ -52,7 +56,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         num_routed_experts: int = 4,
         top_k: int = 2,
         expert_capacity_factor: float = 1.25,
-        use_fused: bool = True,
+        use_fused: bool = False,  # Default False for torch.compile compatibility
     ):
         super().__init__()
         
@@ -158,6 +162,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
         total_assignments = N * self.top_k
         
         # ====== FUSED UP-PROJECTION ======
+        # use_fused=True requires NOT using torch.compile with fullgraph=True
         if self.use_fused:
             try:
                 h_up_sorted = self._fused_up_projection(
@@ -198,7 +203,6 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         return output, aux_loss_dict
     
-    @torch.compiler.disable
     def _fused_up_projection(
         self,
         x_flat: Tensor,           # [N, dim]
@@ -244,7 +248,6 @@ class FusedDeepSeekMoEMLP(nn.Module):
         
         return h_up_sorted
     
-    @torch.compiler.disable
     def _naive_up_projection(
         self,
         x_flat: Tensor,
@@ -254,6 +257,7 @@ class FusedDeepSeekMoEMLP(nn.Module):
     ) -> Tensor:
         """
         Naive UP-projection (fallback) using standard PyTorch.
+        Fully traceable by torch.compile.
         """
         # Gather input for all assignments
         x_gathered = x_flat[sorted_token_indices.long()]  # [total_assignments, dim]
@@ -261,23 +265,22 @@ class FusedDeepSeekMoEMLP(nn.Module):
         # Shared UP: same for all tokens
         h_shared = F.linear(x_gathered, self.shared_expert_up.T.type_as(x_gathered))
         
-        # Routed UP: per-expert
+        # Routed UP: compute for all experts and mask
+        # This avoids data-dependent branches for torch.compile compatibility
         h_routed = torch.zeros(
             total_assignments, self.hdim,
             dtype=x_gathered.dtype, device=x_gathered.device
         )
         
         for e in range(self.num_routed_experts):
-            mask = (sorted_expert_indices == e)
-            if mask.any():
-                x_e = x_gathered[mask]
-                h_routed[mask] = F.linear(
-                    x_e, self.routed_experts_up[e].T.type_as(x_e)
-                )
+            # Compute for ALL tokens through this expert
+            h_e = F.linear(x_gathered, self.routed_experts_up[e].T.type_as(x_gathered))
+            # Mask to only keep tokens assigned to this expert
+            mask = (sorted_expert_indices == e).unsqueeze(-1).to(h_e.dtype)
+            h_routed = h_routed + h_e * mask
         
         return h_shared + h_routed
     
-    @torch.compiler.disable
     def _down_projection(
         self,
         h_sorted: Tensor,           # [total_assignments, hdim]
@@ -286,25 +289,26 @@ class FusedDeepSeekMoEMLP(nn.Module):
     ) -> Tensor:
         """
         DOWN-projection (not fused) - per-expert computation.
+        Fully traceable by torch.compile.
         
         Both shared and routed DOWN projections.
         """
         # Shared DOWN: same for all
         y_shared = F.linear(h_sorted, self.shared_expert_down.type_as(h_sorted))
         
-        # Routed DOWN: per-expert
+        # Routed DOWN: compute for all experts and mask
+        # This avoids data-dependent branches for torch.compile compatibility
         y_routed = torch.zeros(
             total_assignments, self.dim,
             dtype=h_sorted.dtype, device=h_sorted.device
         )
         
         for e in range(self.num_routed_experts):
-            mask = (sorted_expert_indices == e)
-            if mask.any():
-                h_e = h_sorted[mask]
-                y_routed[mask] = F.linear(
-                    h_e, self.routed_experts_down[e].type_as(h_e)
-                )
+            # Compute for ALL tokens through this expert
+            y_e = F.linear(h_sorted, self.routed_experts_down[e].type_as(h_sorted))
+            # Mask to only keep tokens assigned to this expert
+            mask = (sorted_expert_indices == e).unsqueeze(-1).to(y_e.dtype)
+            y_routed = y_routed + y_e * mask
         
         return y_shared + y_routed
     
